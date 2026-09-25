@@ -393,8 +393,16 @@ class _Searcher:
                 best_var = nid
         return best_var
 
-    def _dfs(self, phase: str, cur_conflicts: int, cur_warnings: int) -> bool:
-        """返回 True 表示已达成该阶段目标（可行性=(0,0)方案；优化=冲突已降为 0）。"""
+    def _open_node(
+        self, phase: str, cur_conflicts: int, cur_warnings: int
+    ) -> Any:
+        """打开一个搜索节点：预算/剪枝/叶子判定与 MRV 选变量。
+
+        返回 ``True``/``False`` 表示该节点无需分支即可定论（阶段目标达成、
+        被剪枝、预算耗尽或叶子非目标）；否则返回一个待展开的**栈帧**（字典），
+        由 :meth:`_dfs` 压栈迭代展开。每打开一个节点计一次 ``nodes_seen``，
+        判定口径与顺序和此前的递归实现完全一致。
+        """
         self.nodes_seen += 1
         if self.nodes_seen > _SEARCH_BUDGET or (
             time.monotonic() - self._started_at > _SEARCH_TIME_BUDGET
@@ -428,36 +436,97 @@ class _Searcher:
         var = self._pick_variable()
         if var is None:
             return False
-        for token, (add_c, add_w) in self.deltas[var].items():
-            new_c, new_w = cur_conflicts + add_c, cur_warnings + add_w
-            # 候选本身已不可行（含被 MRV 选中的“空域”变量）：不赋值、不翻计数
-            if not self._within_bound(phase, new_c, new_w):
-                continue
-            if self.feasible_count[var] == 0:
-                self.empty_domains -= 1  # var 离开未赋值集合（按本次尝试前的当前计数）
-            self.assignment[var] = token
-            # 只有 var 的未赋值邻居的候选代价会变化
-            touched = [
-                item["other"]
-                for item in self.neighbors[var]
-                if item["other"] not in self.assignment
-            ]
-            for nid in dict.fromkeys(touched):
-                self._recompute_neighbor(phase, nid, new_c, new_w)
-            if self.empty_domains == 0 and self._dfs(phase, new_c, new_w):
-                return True  # 可行性阶段：(0,0) 方案；优化阶段：冲突已为 0（即告警最优）
-            # 撤销：先把 var 移出赋值，再统一按**父层界**重算 var 与其邻居。
-            # 关键一：var 已撤销后，邻居重算不会把 var 当已固定端，var 自身重算
-            # 也不会把自己的残留赋值算进候选代价；
-            # 关键二：用父层 (cur_conflicts, cur_warnings) 作局部代价基准，
-            # 但“是否可行”只取决于当前全局最优界 best（子树可能收紧过它）；
-            # 关键三：子树收紧界后，**不相邻**未赋值变量的候选代价不变、却可能因
-            # 新界变得不可行，故再全量刷新一次所有未赋值变量的可行计数，
-            # 避免 MRV/空域剪枝沿用陈旧计数误杀父层兄弟分支。
-            self.assignment.pop(var)
-            for nid in dict.fromkeys([var] + touched):
-                self._recompute_neighbor(phase, nid, cur_conflicts, cur_warnings)
-            self._refresh_unassigned_bound(phase, cur_conflicts, cur_warnings)
+        return {
+            "var": var,
+            # 候选快照：撤销时 deltas[var] 会被重算（重新绑定新 dict），快照保证
+            # 本层始终按进入时的候选声明顺序与增量代价遍历，与递归版语义一致。
+            "items": list(self.deltas[var].items()),
+            "idx": 0,
+            "conflicts": cur_conflicts,
+            "warnings": cur_warnings,
+            # 已下钻、待子树失败弹栈后再撤销的邻居列表（None 表示无挂起赋值）
+            "pending": None,
+        }
+
+    def _undo_assignment(
+        self, phase: str, var: str, touched: List[str],
+        cur_conflicts: int, cur_warnings: int,
+    ) -> None:
+        """撤销一次赋值：先把 var 移出赋值，再统一按**本层界**重算 var 与其邻居。
+
+        关键一：var 已撤销后，邻居重算不会把 var 当已固定端，var 自身重算
+        也不会把自己的残留赋值算进候选代价；
+        关键二：用本层 (cur_conflicts, cur_warnings) 作局部代价基准，
+        但“是否可行”只取决于当前全局最优界 best（子树可能收紧过它）；
+        关键三：子树收紧界后，**不相邻**未赋值变量的候选代价不变、却可能因
+        新界变得不可行，故再全量刷新一次所有未赋值变量的可行计数，
+        避免 MRV/空域剪枝沿用陈旧计数误杀本层兄弟分支。
+        """
+        self.assignment.pop(var)
+        for nid in dict.fromkeys([var] + touched):
+            self._recompute_neighbor(phase, nid, cur_conflicts, cur_warnings)
+        self._refresh_unassigned_bound(phase, cur_conflicts, cur_warnings)
+
+    def _dfs(self, phase: str, cur_conflicts: int, cur_warnings: int) -> bool:
+        """返回 True 表示已达成该阶段目标（可行性=(0,0)方案；优化=冲突已降为 0）。
+
+        用**显式栈**代替递归推进/回退：搜索深度等于已赋值变量数，上千个包的
+        赋值链不再受 Python 调用栈上限（``sys.getrecursionlimit``）约束。
+        节点打开顺序、候选遍历顺序、增量重算与界刷新口径与递归版完全一致，
+        故结论、选定方案与 ``nodes_seen`` 计数均不变。
+        """
+        root = self._open_node(phase, cur_conflicts, cur_warnings)
+        if isinstance(root, bool):
+            return root
+        stack: List[Dict[str, Any]] = [root]
+        while stack:
+            frame = stack[-1]
+            var = frame["var"]
+            # 上一轮下钻的子节点已弹栈（子树失败）：先撤销挂起的赋值再继续本层候选
+            if frame["pending"] is not None:
+                self._undo_assignment(
+                    phase, var, frame["pending"],
+                    frame["conflicts"], frame["warnings"],
+                )
+                frame["pending"] = None
+            descended = False
+            while frame["idx"] < len(frame["items"]):
+                token, (add_c, add_w) = frame["items"][frame["idx"]]
+                frame["idx"] += 1
+                new_c = frame["conflicts"] + add_c
+                new_w = frame["warnings"] + add_w
+                # 候选本身已不可行（含被 MRV 选中的“空域”变量）：不赋值、不翻计数
+                if not self._within_bound(phase, new_c, new_w):
+                    continue
+                if self.feasible_count[var] == 0:
+                    self.empty_domains -= 1  # var 离开未赋值集合（按本次尝试前的当前计数）
+                self.assignment[var] = token
+                # 只有 var 的未赋值邻居的候选代价会变化
+                touched = [
+                    item["other"]
+                    for item in self.neighbors[var]
+                    if item["other"] not in self.assignment
+                ]
+                for nid in dict.fromkeys(touched):
+                    self._recompute_neighbor(phase, nid, new_c, new_w)
+                child: Any = False
+                if self.empty_domains == 0:
+                    child = self._open_node(phase, new_c, new_w)
+                    if child is True:
+                        return True  # 可行性：(0,0) 方案；优化：冲突已为 0（即告警最优）
+                if child is not False:
+                    # 子节点展开为新栈帧：挂起当前赋值，待子树失败弹栈后再撤销
+                    frame["pending"] = touched
+                    stack.append(child)
+                    descended = True
+                    break
+                # 未下钻或子节点立即被剪：原地撤销，继续本层下一个候选
+                self._undo_assignment(
+                    phase, var, touched,
+                    frame["conflicts"], frame["warnings"],
+                )
+            if not descended:
+                stack.pop()  # 本层候选穷尽：向父层返回 False（父层弹栈后撤销其挂起赋值）
         return False
 
     def solve(self) -> Dict[str, Any]:

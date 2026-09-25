@@ -196,6 +196,24 @@ def test_empty_audit() -> None:
            and report["summary"]["packages"] == 0)
 
 
+def test_many_independent_packages_beyond_recursion_limit() -> None:
+    # 1100 个彼此独立、许可证均为 MIT 的包：赋值深度 1100 超出 Python 默认
+    # 递归上限（1000），迭代式搜索应照常给出全图可行与 1100 个选定包。
+    packages = [
+        {"name": "pkg%d" % i, "version": "1", "license": "MIT"}
+        for i in range(1100)
+    ]
+    result = analyzer.analyze_manifest(_manifest(packages))
+    report = gs.select_graph_licenses(result)
+    _check("1100 feasible", report["status"] == gs.FEASIBLE, report["conclusion"])
+    _check("1100 judged feasible", report["judged_outcome"] == gs.FEASIBLE)
+    selected = [s for s in report["selections"] if s["status"] == gs.SEL_SELECTED]
+    _check("1100 selected", len(selected) == 1100, str(len(selected)))
+    _check("1100 all MIT", all(s["selected_token"] == "MIT" for s in selected))
+    _check("1100 fully determined", report["summary"]["fully_determined"] is True)
+    _check("1100 not truncated", report["summary"]["search_truncated"] is False)
+
+
 def test_cyclonedx_supported() -> None:
     bom = {
         "bomFormat": "CycloneDX",
@@ -258,6 +276,7 @@ def main() -> None:
     test_unknown_but_known_subgraph_unsolvable()
     test_deterministic_across_runs()
     test_empty_audit()
+    test_many_independent_packages_beyond_recursion_limit()
     test_cyclonedx_supported()
     test_input_not_mutated_and_read_only()
     print("\nall graphselect tests passed.")
