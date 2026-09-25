@@ -247,6 +247,47 @@ def test_input_not_mutated_and_read_only() -> None:
     _check("reviews untouched", database.list_reviews(limit=500) == reviews_before)
 
 
+def test_large_independent_graph_no_recursion() -> None:
+    # 1100 个彼此独立、许可证均为 MIT 的包：旧的递归回溯会沿逐包赋值下潜
+    # 1100 层，超过 Python 默认调用栈上限（1000）而抛 RecursionError；
+    # 迭代显式栈后应返回全图可行，且 1100 个包全部选定为 MIT。
+    packages = [
+        {"name": "pkg-%04d" % i, "version": "1", "license": "MIT"}
+        for i in range(1100)
+    ]
+    result = analyzer.analyze_manifest(_manifest(packages))
+    report = gs.select_graph_licenses(result)
+    _check("large feasible", report["status"] == gs.FEASIBLE, report["conclusion"])
+    sel = _sel_map(report)
+    _check("large package count", len(sel) == 1100, str(len(sel)))
+    _check("all 1100 selected MIT", all(tok == "MIT" for tok in sel.values()))
+    _check("large not truncated", report["summary"]["search_truncated"] is False)
+    _check("large fully determined", report["summary"]["fully_determined"] is True)
+
+
+def test_search_budget_exhausted_is_undetermined() -> None:
+    # 搜索节点预算耗尽时不能给出可行或无解结论：整体与已知子图均为未判定，
+    # 不误报 all_relations_compatible / avoids_hard_conflicts。
+    result = analyzer.analyze_manifest(_manifest([
+        {"name": "app", "version": "1", "license": ["MIT", "GPL-3.0"], "dependencies": ["a@1", "b@1"]},
+        {"name": "a", "version": "1", "license": ["MIT", "Apache-2.0"]},
+        {"name": "b", "version": "1", "license": ["ISC", "MIT"], "dependencies": ["a@1"]},
+    ]))
+    saved_budget = gs._SEARCH_BUDGET
+    gs._SEARCH_BUDGET = 0  # 第一个搜索节点即超预算
+    try:
+        report = gs.select_graph_licenses(result)
+    finally:
+        gs._SEARCH_BUDGET = saved_budget
+    _check("truncated flag", report["summary"]["search_truncated"] is True)
+    _check("undetermined status", report["status"] == gs.UNDETERMINED, report["conclusion"])
+    _check("judged outcome withheld", report["judged_outcome"] is None)
+    _check("not claiming feasible", report["summary"]["all_relations_compatible"] is False)
+    _check("not claiming avoids conflicts", report["summary"]["avoids_hard_conflicts"] is False)
+    _check("not fully determined", report["summary"]["fully_determined"] is False)
+    _check("conclusion says truncated", "预算" in report["conclusion"])
+
+
 def main() -> None:
     test_report_envelope()
     test_or_choice_picks_compatible()
@@ -260,6 +301,8 @@ def main() -> None:
     test_empty_audit()
     test_cyclonedx_supported()
     test_input_not_mutated_and_read_only()
+    test_large_independent_graph_no_recursion()
+    test_search_budget_exhausted_is_undetermined()
     print("\nall graphselect tests passed.")
 
 

@@ -394,71 +394,143 @@ class _Searcher:
         return best_var
 
     def _dfs(self, phase: str, cur_conflicts: int, cur_warnings: int) -> bool:
-        """返回 True 表示已达成该阶段目标（可行性=(0,0)方案；优化=冲突已降为 0）。"""
-        self.nodes_seen += 1
-        if self.nodes_seen > _SEARCH_BUDGET or (
-            time.monotonic() - self._started_at > _SEARCH_TIME_BUDGET
-        ):
-            self.truncated = True
-            return False
-        # 优化阶段：当前冲突 + 未决关系中不可避免的冲突下界若已不优于当前最优，剪枝
-        if (
-            phase == _PHASE_OPTIMIZE
-            and self.best_conflicts is not None
-            and cur_conflicts + self._future_conflict_lb() > self.best_conflicts
-        ):
-            return False
-        if len(self.assignment) == len(self.order):
-            if phase == _PHASE_FEASIBILITY:
-                # 界恒为 (0,0)，到达完整赋值即全兼容方案：直接捕获（确定性的第一份）
-                self.best_assignment = dict(self.assignment)
-                self.best_conflicts = 0
-                self.best_warnings = 0
-                return True
-            if self.best_conflicts is None or (
-                cur_conflicts, cur_warnings
-            ) < (self.best_conflicts, self.best_warnings or 0):
-                self.best_assignment = dict(self.assignment)
-                self.best_conflicts = cur_conflicts
-                self.best_warnings = cur_warnings
-            # 优化阶段找到 (0,0) 才是全局最优（可行性阶段已证伪时不会发生）；
-            # 其余叶子（含 (0, w>0)）都要继续搜索字典序更优解，由界剪枝终止。
-            return cur_conflicts == 0 and cur_warnings == 0
+        """显式栈迭代版回溯（语义与递归版逐行对应，但搜索深度不受调用栈限制）。
 
-        var = self._pick_variable()
-        if var is None:
-            return False
-        for token, (add_c, add_w) in self.deltas[var].items():
-            new_c, new_w = cur_conflicts + add_c, cur_warnings + add_w
-            # 候选本身已不可行（含被 MRV 选中的“空域”变量）：不赋值、不翻计数
-            if not self._within_bound(phase, new_c, new_w):
-                continue
-            if self.feasible_count[var] == 0:
-                self.empty_domains -= 1  # var 离开未赋值集合（按本次尝试前的当前计数）
-            self.assignment[var] = token
-            # 只有 var 的未赋值邻居的候选代价会变化
-            touched = [
-                item["other"]
-                for item in self.neighbors[var]
-                if item["other"] not in self.assignment
-            ]
-            for nid in dict.fromkeys(touched):
-                self._recompute_neighbor(phase, nid, new_c, new_w)
-            if self.empty_domains == 0 and self._dfs(phase, new_c, new_w):
-                return True  # 可行性阶段：(0,0) 方案；优化阶段：冲突已为 0（即告警最优）
-            # 撤销：先把 var 移出赋值，再统一按**父层界**重算 var 与其邻居。
-            # 关键一：var 已撤销后，邻居重算不会把 var 当已固定端，var 自身重算
-            # 也不会把自己的残留赋值算进候选代价；
-            # 关键二：用父层 (cur_conflicts, cur_warnings) 作局部代价基准，
-            # 但“是否可行”只取决于当前全局最优界 best（子树可能收紧过它）；
-            # 关键三：子树收紧界后，**不相邻**未赋值变量的候选代价不变、却可能因
-            # 新界变得不可行，故再全量刷新一次所有未赋值变量的可行计数，
-            # 避免 MRV/空域剪枝沿用陈旧计数误杀父层兄弟分支。
-            self.assignment.pop(var)
-            for nid in dict.fromkeys([var] + touched):
-                self._recompute_neighbor(phase, nid, cur_conflicts, cur_warnings)
-            self._refresh_unassigned_bound(phase, cur_conflicts, cur_warnings)
-        return False
+        返回 True 表示已达成该阶段目标（可行性=(0,0)方案；优化=冲突已降为 0）。
+
+        每个栈帧是一层赋值现场：变量、该层 (cur_conflicts, cur_warnings)、
+        候选快照（进入该节点时的 ``deltas``，与递归版 for 循环同源）、候选游标
+        与本次尝试触及的未赋值邻居。搜索推进=赋值后压入子帧；回退=弹出/撤销后
+        推进游标，全部状态都在堆上，上千变量的线性链也不会触发 RecursionError。
+        """
+        # 栈帧键名
+        F_VAR, F_C, F_W = "var", "cur_c", "cur_w"
+        F_TOKENS, F_IDX, F_TOUCHED = "tokens", "idx", "touched"
+
+        stack: List[Dict[str, Any]] = []
+        # 下一个待进入节点的 (冲突, 告警)；非 None 时先执行“进入节点”首部
+        pending_enter: Optional[Tuple[int, int]] = (cur_conflicts, cur_warnings)
+        # 已终止（剪枝/叶子）但未压帧的子节点返回值；None 表示无子结论待处理
+        pending_verdict: Optional[bool] = None
+
+        while True:
+            # === 进入一个搜索节点（原递归 _dfs 的函数体首部）===
+            if pending_enter is not None:
+                cur_c, cur_w = pending_enter
+                pending_enter = None
+                self.nodes_seen += 1
+                if self.nodes_seen > _SEARCH_BUDGET or (
+                    time.monotonic() - self._started_at > _SEARCH_TIME_BUDGET
+                ):
+                    self.truncated = True
+                    return False
+                # 优化阶段：当前冲突 + 未决关系中不可避免的冲突下界若已不优于当前最优，剪枝
+                if (
+                    phase == _PHASE_OPTIMIZE
+                    and self.best_conflicts is not None
+                    and cur_c + self._future_conflict_lb() > self.best_conflicts
+                ):
+                    verdict: Optional[bool] = False
+                elif len(self.assignment) == len(self.order):
+                    if phase == _PHASE_FEASIBILITY:
+                        # 界恒为 (0,0)，到达完整赋值即全兼容方案：直接捕获（确定性的第一份）
+                        self.best_assignment = dict(self.assignment)
+                        self.best_conflicts = 0
+                        self.best_warnings = 0
+                        return True
+                    if self.best_conflicts is None or (
+                        cur_c, cur_w
+                    ) < (self.best_conflicts, self.best_warnings or 0):
+                        self.best_assignment = dict(self.assignment)
+                        self.best_conflicts = cur_c
+                        self.best_warnings = cur_w
+                    # 优化阶段找到 (0,0) 才是全局最优（可行性阶段已证伪时不会发生）；
+                    # 其余叶子（含 (0, w>0)）都要继续搜索字典序更优解，由界剪枝终止。
+                    verdict = cur_c == 0 and cur_w == 0
+                else:
+                    var = self._pick_variable()
+                    if var is None:
+                        verdict = False
+                    else:
+                        # 候选快照与增量代价在进入节点时固定（等价于递归版进入 for 前）
+                        stack.append(
+                            {
+                                F_VAR: var,
+                                F_C: cur_c,
+                                F_W: cur_w,
+                                F_TOKENS: list(self.deltas[var].items()),
+                                F_IDX: 0,
+                                F_TOUCHED: [],
+                            }
+                        )
+                        verdict = None  # 已压入新帧：下方直接扫描其候选
+                if verdict is not None:
+                    # 节点未压帧即终止（下界剪枝/叶子/无变量）：结论交给父帧；
+                    # 根节点直接终止时整棵搜索结束。
+                    if not stack:
+                        return verdict
+                    pending_verdict = verdict
+                    continue  # 交外层循环恢复父帧，勿扫描栈顶（那是父帧）
+                # verdict is None：新帧已在栈顶，落到候选扫描
+            elif pending_verdict is not None:
+                # === 子节点返回：True 逐层上传；False 则撤销父帧本次尝试 ===
+                if pending_verdict:
+                    return True
+                pending_verdict = None
+                frame = stack[-1]
+                var = frame[F_VAR]
+                self.assignment.pop(var)
+                # 与递归版回退完全一致：var 先撤销，再按父层界重算 var 与邻居，
+                # 最后全量刷新不相邻变量在收紧后界下的可行计数。
+                for nid in dict.fromkeys([var] + frame[F_TOUCHED]):
+                    self._recompute_neighbor(
+                        phase, nid, frame[F_C], frame[F_W]
+                    )
+                self._refresh_unassigned_bound(phase, frame[F_C], frame[F_W])
+                frame[F_IDX] += 1
+
+            # === 扫描栈顶帧的候选（原递归版 for 循环）===
+            while True:
+                frame = stack[-1]
+                if frame[F_IDX] >= len(frame[F_TOKENS]):
+                    # 本帧候选穷尽：弹出后父帧按“收到 False”处理
+                    stack.pop()
+                    if not stack:
+                        return False
+                    pending_verdict = False
+                    break  # 回到外层循环恢复父帧
+                var = frame[F_VAR]
+                cur_c, cur_w = frame[F_C], frame[F_W]
+                token, (add_c, add_w) = frame[F_TOKENS][frame[F_IDX]]
+                new_c, new_w = cur_c + add_c, cur_w + add_w
+                # 候选本身已不可行（含被 MRV 选中的“空域”变量）：不赋值、不翻计数
+                if not self._within_bound(phase, new_c, new_w):
+                    frame[F_IDX] += 1
+                    continue
+                if self.feasible_count[var] == 0:
+                    self.empty_domains -= 1  # var 离开未赋值集合（按本次尝试前的当前计数）
+                self.assignment[var] = token
+                # 只有 var 的未赋值邻居的候选代价会变化
+                touched = list(
+                    dict.fromkeys(
+                        item["other"]
+                        for item in self.neighbors[var]
+                        if item["other"] not in self.assignment
+                    )
+                )
+                frame[F_TOUCHED] = touched
+                for nid in touched:
+                    self._recompute_neighbor(phase, nid, new_c, new_w)
+                if self.empty_domains == 0:
+                    # 推进到子节点（原递归调用点）：下轮外层循环进入
+                    pending_enter = (new_c, new_w)
+                    break
+                # 空域短路：原递归版在 empty_domains>0 时不发起调用，立即回退本候选
+                self.assignment.pop(var)
+                for nid in dict.fromkeys([var] + touched):
+                    self._recompute_neighbor(phase, nid, cur_c, cur_w)
+                self._refresh_unassigned_bound(phase, cur_c, cur_w)
+                frame[F_IDX] += 1
 
     def solve(self) -> Dict[str, Any]:
         if self.order:
